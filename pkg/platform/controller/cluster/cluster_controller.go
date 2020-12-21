@@ -22,7 +22,9 @@ import (
 	"context"
 	"fmt"
 	"reflect"
+	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"k8s.io/apimachinery/pkg/util/rand"
@@ -59,6 +61,8 @@ const (
 
 	resyncInternal = 5 * time.Minute
 )
+
+var startOnce sync.Once
 
 // Controller is responsible for performing actions dependent upon a cluster phase.
 type Controller struct {
@@ -256,6 +260,12 @@ func (c *Controller) reconcile(ctx context.Context, key string, cluster *platfor
 
 	c.ensureSyncCredentialClusterName(ctx, cluster)
 	c.ensureSyncClusterMachineNodeLabel(ctx, cluster)
+
+	startOnce.Do(func() {
+		go wait.Forever(func() {
+			c.ensureSyncClusterArchLabel(ctx)
+		}, time.Minute * 5)
+	})
 
 	switch cluster.Status.Phase {
 	case platformv1.ClusterInitializing:
@@ -528,6 +538,73 @@ func (c *Controller) ensureSyncClusterMachineNodeLabel(ctx context.Context, clus
 
 		if err != nil {
 			log.FromContext(ctx).Error(err, "sync ClusterMachine node label error")
+		}
+	}
+}
+
+func (c *Controller) ensureSyncClusterArchLabel(ctx context.Context) {
+	clusterList, err := c.platformClient.Clusters().List(ctx, metav1.ListOptions{})
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			return
+		}
+		log.FromContext(ctx).Error(err, "Get cluster list error")
+		return
+	}
+
+	for _, cls := range clusterList.Items {
+		cluster := &cls
+		err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+			clusterWrapper, err := typesv1.GetCluster(ctx, c.platformClient, cluster)
+			if err != nil {
+				log.FromContext(ctx).Error(err, "Get cluster error")
+				return err
+			}
+
+			client, err := clusterWrapper.Clientset()
+			if err != nil {
+				log.FromContext(ctx).Error(err, "get client set error")
+				return err
+			}
+
+			nodeList, err := client.CoreV1().Nodes().List(ctx, metav1.ListOptions{})
+			if err != nil {
+				if apierrors.IsNotFound(err) {
+					return nil
+				}
+				return err
+			}
+
+			var archs []string
+			var archMap = make(map[string]bool)
+			for _, node := range nodeList.Items {
+				if node.Status.NodeInfo.Architecture != "" {
+					archMap[node.Status.NodeInfo.Architecture] = true
+				}
+			}
+			for arch, value := range archMap {
+				if value {
+					archs = append(archs, arch)
+				}
+			}
+			sort.Strings(archs)
+
+			oldCluster := cluster.DeepCopy()
+			labels := cluster.GetLabels()
+			labels["cpaas.io/arch"] = strings.Join(archs, ".")
+			cluster.SetLabels(labels)
+
+			patchBytes, err := strategicpatch.GetPatchBytes(oldCluster, cluster)
+			if err != nil {
+				return fmt.Errorf("GetPatchBytes for cluster error: %w", err)
+			}
+
+			_, err = c.platformClient.Clusters().Patch(ctx, cluster.Name, types.StrategicMergePatchType, patchBytes, metav1.PatchOptions{})
+			return err
+		})
+
+		if err != nil {
+			log.FromContext(ctx).Error(err, "sync cluster arch label error")
 		}
 	}
 }
